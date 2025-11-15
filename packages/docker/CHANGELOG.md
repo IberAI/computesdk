@@ -1,5 +1,40 @@
 # @computesdk/docker
 
+## 1.1.1
+
+### Patch Changes
+
+- computesdk@1.8.1
+
+## 1.1.0
+
+### Minor Changes
+
+- 99b807c: Integrating packages w/ @computesdk/client
+
+### Patch Changes
+
+- Updated dependencies [99b807c]
+  - computesdk@1.8.0
+
+## 1.0.6
+
+### Patch Changes
+
+- computesdk@1.7.6
+
+## 1.0.5
+
+### Patch Changes
+
+- computesdk@1.7.5
+
+## 1.0.4
+
+### Patch Changes
+
+- computesdk@1.7.4
+
 ## 1.0.3
 
 ### Patch Changes

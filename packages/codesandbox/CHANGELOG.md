@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.4.1
+
+### Patch Changes
+
+- computesdk@1.8.1
+
+## 1.4.0
+
+### Minor Changes
+
+- 99b807c: Integrating packages w/ @computesdk/client
+
+### Patch Changes
+
+- Updated dependencies [99b807c]
+  - computesdk@1.8.0
+
+## 1.3.6
+
+### Patch Changes
+
+- computesdk@1.7.6
+
+## 1.3.5
+
+### Patch Changes
+
+- computesdk@1.7.5
+
+## 1.3.4
+
+### Patch Changes
+
+- computesdk@1.7.4
+
 ## 1.3.3
 
 ### Patch Changes
