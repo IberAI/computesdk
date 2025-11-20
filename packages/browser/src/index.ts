@@ -14,113 +14,133 @@ import type {
 import { browserFs } from './filesystem/filesystem';
 
 // -----------------------------------------
-// Browser Provider (Pyodide runtime)
+// Browser Provider (Python via Pyodide)
 // -----------------------------------------
 
-/**
- * Optional config for the Browser provider.
- * You can extend this later (e.g., add Node/WebContainers, WASI, env vars, etc.)
- */
 export interface BrowserConfig {
-  /** Default runtime (currently only 'python' is supported) */
   runtime?: Extract<Runtime, 'python'>;
-  /** Optional Pyodide base URL (ending with /), e.g. 'https://cdn.jsdelivr.net/pyodide/v0.29.0/' */
   pyodideIndexURL?: string;
 }
 
-/** We currently only support Python via Pyodide */
 type SupportedRuntime = Extract<Runtime, 'python'>;
 
-/** In-memory sandbox handle kept by the provider */
 interface BrowserSandbox {
   id: string;
   runtime: SupportedRuntime;
-  worker: Worker; // classic worker using importScripts inside
+  worker: Worker;
 }
 
-/** Registry of active sandboxes (in-memory) */
 const registry = new Map<string, BrowserSandbox>();
 
-/** Spawn a Pyodide worker (classic worker so importScripts works) */
+/**
+ * Spawn Python worker WITHOUT using import.meta.url
+ * Works in tsup, webpack, vite without tsconfig changes.
+ */
 function spawnPythonWorker(): Worker {
-  return new Worker(new URL('./workers/python.worker.ts', import.meta.url), { type: 'classic' });
+  return new Worker('./workers/python.worker.js', {
+    type: 'classic',
+  });
 }
 
-/** Tiny RPC helper with correlation id */
-function callWorker<TReq extends Record<string, any>, TRes = any>(
-  worker: Worker,
-  msg: TReq
-): Promise<TRes> {
+/** RPC helper */
+function callWorker(worker: Worker, msg: any): Promise<any> {
   return new Promise((resolve) => {
     const id = crypto.randomUUID();
-    const onMsg = (e: MessageEvent) => {
+
+    const listener = (e: MessageEvent) => {
       if (e.data?.id !== id) return;
-      worker.removeEventListener('message', onMsg);
-      resolve(e.data as TRes);
+      worker.removeEventListener('message', listener);
+      resolve(e.data);
     };
-    worker.addEventListener('message', onMsg);
+
+    worker.addEventListener('message', listener);
     worker.postMessage({ id, ...msg });
   });
 }
 
-/** Normalize ExecutionResult from worker response */
-function toExecutionResult(res: {
-  ok: boolean;
-  exitCode?: number;
-  stdout?: string;
-  stderr?: string;
-  error?: string;
-}): ExecutionResult {
+/** Build a correct ExecutionResult */
+function makeExecutionResult(
+  sandboxId: string,
+  response: {
+    ok: boolean;
+    exitCode?: number;
+    stdout?: string;
+    stderr?: string;
+    error?: string;
+  }
+): ExecutionResult {
   return {
-    exitCode: typeof res.exitCode === 'number' ? res.exitCode : res.ok ? 0 : 1,
-    stdout: res.stdout ?? '',
-    stderr: res.stderr ?? (res.ok ? '' : (res.error ?? '')),
+    exitCode:
+      typeof response.exitCode === 'number'
+        ? response.exitCode
+        : response.ok
+          ? 0
+          : 1,
+    stdout: response.stdout ?? '',
+    stderr: response.stderr ?? (response.ok ? '' : response.error ?? ''),
+    sandboxId,
+    provider: '@computesdk/browser',
+    executionTime: 0,
   };
 }
 
-/**
- * Create the Browser provider using the factory pattern,
- * matching the style of your Cloudflare provider.
- */
-export const browser = createProvider<BrowserSandbox, BrowserConfig>({
+// ========================================================
+// Internal provider using createProvider
+// ========================================================
+const internalProvider = createProvider<BrowserSandbox, BrowserConfig>({
   name: 'browser',
+
   methods: {
     sandbox: {
-      // ------------------------------
-      // Collection operations
-      // ------------------------------
-      create: async (config: BrowserConfig = {}, options?: CreateSandboxOptions) => {
-        const desired: SupportedRuntime = (options?.runtime as SupportedRuntime) ?? (config.runtime ?? 'python');
-        if (desired !== 'python') {
-          throw new Error(`Unsupported runtime "${desired}" for browser provider. Only "python" is available.`);
+      /** Create Pyodide sandbox */
+      create: async (
+        config: BrowserConfig = {},
+        options?: CreateSandboxOptions
+      ) => {
+        const runtime: SupportedRuntime =
+          (options?.runtime as SupportedRuntime) ?? config.runtime ?? 'python';
+
+        if (runtime !== 'python') {
+          throw new Error(
+            `Unsupported runtime "${runtime}". Only "python" is supported.`
+          );
         }
 
         const worker = spawnPythonWorker();
-        const sandboxId = options?.sandboxId ?? `browser-sb-${crypto.randomUUID()}`;
+        const sandboxId =
+          options?.sandboxId ?? `browser-sb-${crypto.randomUUID()}`;
 
-        // Initialize Pyodide (optionally pass a custom indexURL)
-        await callWorker(worker, { type: 'init', indexURL: config.pyodideIndexURL });
+        await callWorker(worker, {
+          type: 'init',
+          indexURL: config.pyodideIndexURL,
+        });
 
-        const sandbox: BrowserSandbox = { id: sandboxId, runtime: 'python', worker };
+        const sandbox: BrowserSandbox = {
+          id: sandboxId,
+          runtime: 'python',
+          worker,
+        };
+
         registry.set(sandboxId, sandbox);
-
         return { sandbox, sandboxId };
       },
 
-      getById: async (_config: BrowserConfig, sandboxId: string) => {
+      /** lookup by id */
+      getById: async (_config, sandboxId) => {
         const sb = registry.get(sandboxId);
         return sb ? { sandbox: sb, sandboxId } : null;
       },
 
-      list: async (_config: BrowserConfig) => {
-        const out: Array<{ sandbox: BrowserSandbox; sandboxId: string }> = [];
-        for (const [sandboxId, sandbox] of registry.entries()) {
-          out.push({ sandbox, sandboxId });
-        }
-        return out;
+      /** list sandboxes */
+      list: async () => {
+        return [...registry.entries()].map(([sandboxId, sandbox]) => ({
+          sandbox,
+          sandboxId,
+        }));
       },
 
-      destroy: async (_config: BrowserConfig, sandboxId: string) => {
+      /** destroy */
+      destroy: async (_config, sandboxId) => {
         const sb = registry.get(sandboxId);
         if (sb) {
           try {
@@ -131,69 +151,81 @@ export const browser = createProvider<BrowserSandbox, BrowserConfig>({
         }
       },
 
-      // ------------------------------
-      // Instance operations
-      // ------------------------------
-      runCode: async (sandbox: BrowserSandbox, code: string, _runtime?: Runtime): Promise<ExecutionResult> => {
+      /** run Python code */
+      runCode: async (
+        sandbox: BrowserSandbox,
+        code: string,
+        _runtime?: Runtime
+      ): Promise<ExecutionResult> => {
         if (sandbox.runtime !== 'python') {
-          return { exitCode: 127, stdout: '', stderr: `Unsupported runtime "${sandbox.runtime}" in browser provider` };
+          return makeExecutionResult(sandbox.id, {
+            ok: false,
+            exitCode: 127,
+            stderr: `Unsupported runtime "${sandbox.runtime}"`,
+          });
         }
-        const res = await callWorker(sandbox.worker, { type: 'runCode', code }) as {
-          ok: boolean; exitCode?: number; stdout?: string; stderr?: string; error?: string;
-        };
-        return toExecutionResult(res);
+
+        const res = await callWorker(sandbox.worker, {
+          type: 'runCode',
+          code,
+        });
+
+        return makeExecutionResult(sandbox.id, res);
       },
 
-      runCommand: async (_sandbox: BrowserSandbox, command: string, _args: string[] = []): Promise<ExecutionResult> => {
-        // No shell in the browser — keep a predictable contract
-        return { exitCode: 127, stdout: '', stderr: `runCommand("${command}") is not supported in the browser provider` };
+      /** browser has no shell */
+      runCommand: async (sandbox, command) => {
+        return makeExecutionResult(sandbox.id, {
+          ok: false,
+          exitCode: 127,
+          stderr: `runCommand("${command}") not supported in browser`,
+        });
       },
 
-      getInfo: async (sandbox: BrowserSandbox): Promise<SandboxInfo> => {
-        // Keep minimal, align with your SandboxInfo shape
-        const info: Partial<SandboxInfo> = {
-          id: sandbox.id as any,
-          provider: 'browser' as any,
-          runtime: sandbox.runtime as any,
-          status: 'running' as any,
-        };
-        return info as SandboxInfo;
-      },
+      /** required SandboxInfo fields */
+      getInfo: async (sandbox): Promise<SandboxInfo> => ({
+        id: sandbox.id,
+        provider: '@computesdk/browser',
+        runtime: sandbox.runtime,
+        status: 'running',
+        createdAt: new Date(), // must be Date
+        timeout: 0, // must be number
+      }),
 
-      getUrl: async (_sandbox: BrowserSandbox, _opts: { port: number; protocol?: string }): Promise<string> => {
-        // Pyodide doesn't expose a server port by default.
-        return '';
-      },
+      getUrl: async () => '',
 
-      // ------------------------------
-      // Filesystem facade (OPFS via opfs-worker)
-      // ------------------------------
+      /** OPFS filesystem wrapper */
       filesystem: {
-        // All FS calls delegate to your shared OPFS adapter
-        readFile: async (_sb: BrowserSandbox, path: string): Promise<string> => {
-          return browserFs.readFile(undefined, path);
-        },
-
-        writeFile: async (_sb: BrowserSandbox, path: string, content: string): Promise<void> => {
-          await browserFs.writeFile(undefined, path, content);
-        },
-
-        mkdir: async (_sb: BrowserSandbox, path: string): Promise<void> => {
-          await browserFs.mkdir(undefined, path);
-        },
-
-        readdir: async (_sb: BrowserSandbox, path: string): Promise<FileEntry[]> => {
-          return browserFs.readdir(undefined, path);
-        },
-
-        exists: async (_sb: BrowserSandbox, path: string): Promise<boolean> => {
-          return browserFs.exists(undefined, path);
-        },
-
-        remove: async (_sb: BrowserSandbox, path: string): Promise<void> => {
-          await browserFs.remove(undefined, path);
-        },
+        readFile: async (_sb, path) => browserFs.readFile(undefined, path),
+        writeFile: async (_sb, path, c) =>
+          browserFs.writeFile(undefined, path, c),
+        mkdir: async (_sb, path) => browserFs.mkdir(undefined, path),
+        readdir: async (_sb, path): Promise<FileEntry[]> =>
+          browserFs.readdir(undefined, path),
+        exists: async (_sb, path) => browserFs.exists(undefined, path),
+        remove: async (_sb, path) => browserFs.remove(undefined, path),
       },
     },
   },
 } as ProviderConfig<BrowserSandbox, BrowserConfig>);
+
+// ========================================================
+// Public provider API (required by ComputeSDK test-suite)
+// ========================================================
+export const browser = {
+  providerName: '@computesdk/browser',
+
+  getSupportedRuntimes() {
+    return ['python'];
+  },
+
+  getCapabilities() {
+    return {
+      filesystem: true,
+      commandExecution: false,
+      terminal: false,
+    };
+  },
+
+  ...internalProvider,
+};
