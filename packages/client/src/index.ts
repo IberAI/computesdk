@@ -18,6 +18,7 @@ import { SignalService } from './signal-service';
 export { Terminal } from './terminal';
 export { FileWatcher, type FileChangeEvent } from './file-watcher';
 export { SignalService, type PortSignalEvent, type ErrorSignalEvent, type SignalEvent } from './signal-service';
+export { encodeBinaryMessage, decodeBinaryMessage, isBinaryData, blobToArrayBuffer, MessageType } from './protocol';
 
 // ============================================================================
 // Type Definitions
@@ -32,13 +33,13 @@ export type WebSocketConstructor = new (url: string) => WebSocket;
  * Configuration options for the ComputeSDK client
  */
 export interface ComputeClientConfig {
-  /** API endpoint URL (e.g., https://sandbox-123.preview.computesdk.com) */
-  sandboxUrl: string;
+  /** API endpoint URL (e.g., https://sandbox-123.preview.computesdk.com). Optional in browser - can be auto-detected from URL query param or localStorage */
+  sandboxUrl?: string;
   /** Sandbox ID (required for Sandbox interface operations) */
   sandboxId?: string;
   /** Provider name (e.g., 'e2b', 'vercel') (required for Sandbox interface operations) */
   provider?: string;
-  /** Optional JWT token for authentication */
+  /** Access token or session token for authentication. Optional in browser - can be auto-detected from URL query param or localStorage */
   token?: string;
   /** Optional headers to include with all requests */
   headers?: Record<string, string>;
@@ -46,6 +47,8 @@ export interface ComputeClientConfig {
   timeout?: number;
   /** WebSocket implementation (optional, uses global WebSocket if not provided) */
   WebSocket?: WebSocketConstructor;
+  /** WebSocket protocol: 'binary' (default, recommended) or 'json' (for debugging) */
+  protocol?: 'json' | 'binary';
 }
 
 /**
@@ -57,24 +60,35 @@ export interface HealthResponse {
 }
 
 /**
- * Access token response
+ * Server info response
  */
-export interface AccessTokenResponse {
+export interface InfoResponse {
   message: string;
   data: {
-    id: string;
-    token: string;
-    description?: string;
-    created_at: string;
-    expires_at: string;
-    expires_in: number;
+    auth_enabled: boolean;
+    main_subdomain: string;
+    sandbox_count: number;
+    sandbox_url: string;
+    version: string;
   };
 }
 
 /**
- * Access token list response
+ * Session token response
  */
-export interface AccessTokenListResponse {
+export interface SessionTokenResponse {
+  id: string;
+  token: string;
+  description?: string;
+  createdAt: string;
+  expiresAt: string;
+  expiresIn: number;
+}
+
+/**
+ * Session token list response
+ */
+export interface SessionTokenListResponse {
   message: string;
   data: {
     tokens: Array<{
@@ -106,7 +120,7 @@ export interface AuthStatusResponse {
   message: string;
   data: {
     authenticated: boolean;
-    token_type?: 'license_jwt' | 'access_token';
+    token_type?: 'access_token' | 'session_token';
     expires_at?: string;
   };
 }
@@ -120,10 +134,10 @@ export interface AuthInfoResponse {
     message: string;
     instructions: string;
     endpoints: {
-      create_access_token: string;
-      list_access_tokens: string;
-      get_access_token: string;
-      revoke_access_token: string;
+      create_session_token: string;
+      list_session_tokens: string;
+      get_session_token: string;
+      revoke_session_token: string;
       create_magic_link: string;
       auth_status: string;
       auth_info: string;
@@ -297,22 +311,30 @@ export interface ErrorResponse {
  * ```typescript
  * import { ComputeClient } from '@computesdk/client'
  *
- * // Pattern 1: Admin operations (requires license JWT)
+ * // Pattern 1: Admin operations (requires access token)
  * const adminClient = new ComputeClient({
  *   sandboxUrl: 'https://sandbox-123.preview.computesdk.com',
- *   token: licenseJWT, // From license server
+ *   token: accessToken, // From edge service
  * });
  *
- * // Create access token for regular operations
- * const accessToken = await adminClient.createAccessToken({
+ * // Create session token for delegated operations
+ * const sessionToken = await adminClient.createSessionToken({
  *   description: 'My Application',
  *   expiresIn: 604800, // 7 days
  * });
  *
- * // Pattern 2: Regular operations (access token works)
+ * // Pattern 2: Delegated operations (binary protocol by default)
  * const client = new ComputeClient({
  *   sandboxUrl: 'https://sandbox-123.preview.computesdk.com',
- *   token: accessToken.data.token,
+ *   token: sessionToken.data.token,
+ *   // protocol: 'binary' is the default (50-90% size reduction)
+ * });
+ *
+ * // Pattern 3: JSON protocol for debugging (if needed)
+ * const debugClient = new ComputeClient({
+ *   sandboxUrl: 'https://sandbox-123.preview.computesdk.com',
+ *   token: sessionToken.data.token,
+ *   protocol: 'json', // Use JSON for browser DevTools inspection
  * });
  *
  * // Execute a one-off command
@@ -374,17 +396,55 @@ export class ComputeClient {
   private _ws: WebSocketManager | null = null;
   private WebSocketImpl: WebSocketConstructor;
 
-  constructor(config: ComputeClientConfig) {
+  constructor(config: ComputeClientConfig = {}) {
     this.sandboxId = config.sandboxId;
     this.provider = config.provider;
 
+    // Auto-detect sandbox_url and session_token from URL/localStorage in browser environments
+    let sandboxUrlResolved = config.sandboxUrl;
+    let tokenFromUrl: string | null = null;
+    let sandboxUrlFromUrl: string | null = null;
+
+    if (typeof window !== 'undefined' && window.location && typeof localStorage !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+
+      // Check URL parameters
+      tokenFromUrl = params.get('session_token');
+      sandboxUrlFromUrl = params.get('sandbox_url');
+
+      // Clean up URL if any params were found
+      let urlChanged = false;
+      if (tokenFromUrl) {
+        params.delete('session_token');
+        localStorage.setItem('session_token', tokenFromUrl);
+        urlChanged = true;
+      }
+      if (sandboxUrlFromUrl) {
+        params.delete('sandbox_url');
+        localStorage.setItem('sandbox_url', sandboxUrlFromUrl);
+        urlChanged = true;
+      }
+
+      if (urlChanged) {
+        const search = params.toString() ? `?${params.toString()}` : '';
+        const newUrl = `${window.location.pathname}${search}${window.location.hash}`;
+        window.history.replaceState({}, '', newUrl);
+      }
+
+      // Resolve sandboxUrl: config > URL > localStorage
+      if (!config.sandboxUrl) {
+        sandboxUrlResolved = sandboxUrlFromUrl || localStorage.getItem('sandbox_url') || '';
+      }
+    }
+
     this.config = {
-      sandboxUrl: config.sandboxUrl.replace(/\/$/, ''), // Remove trailing slash
+      sandboxUrl: (sandboxUrlResolved || '').replace(/\/$/, ''), // Remove trailing slash
       sandboxId: config.sandboxId || '',
       provider: config.provider || '',
       token: config.token || '',
       headers: config.headers || {},
       timeout: config.timeout || 30000,
+      protocol: config.protocol || 'binary',
     };
 
     // Use provided WebSocket or fall back to global
@@ -398,8 +458,13 @@ export class ComputeClient {
       );
     }
 
+    // Priority for token: config.token > URL > localStorage
     if (config.token) {
       this._token = config.token;
+    } else if (tokenFromUrl) {
+      this._token = tokenFromUrl;
+    } else if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
+      this._token = localStorage.getItem('session_token');
     }
 
     // Initialize filesystem interface
@@ -441,6 +506,7 @@ export class ComputeClient {
         WebSocket: this.WebSocketImpl,
         autoReconnect: true,
         debug: false,
+        protocol: this.config.protocol,
       });
       await this._ws.connect();
     }
@@ -493,6 +559,17 @@ export class ComputeClient {
 
       if (!response.ok) {
         const error = (data as ErrorResponse).error || response.statusText;
+
+        // Provide helpful error message for 403 on auth endpoints
+        if (response.status === 403 && endpoint.startsWith('/auth/')) {
+          if (endpoint.includes('/session_tokens') || endpoint.includes('/magic-links')) {
+            throw new Error(
+              `Access token required. This operation requires an access token, not a session token.\n` +
+              `API request failed (${response.status}): ${error}`
+            );
+          }
+        }
+
         throw new Error(`API request failed (${response.status}): ${error}`);
       }
 
@@ -524,75 +601,75 @@ export class ComputeClient {
   // ============================================================================
 
   /**
-   * Create an access token (requires license JWT)
+   * Create a session token (requires access token)
    *
-   * Access tokens are delegated credentials that can authenticate API requests
-   * without exposing your license JWT. Only license JWTs can create access tokens.
+   * Session tokens are delegated credentials that can authenticate API requests
+   * without exposing your access token. Only access tokens can create session tokens.
    *
    * @param options - Token configuration
-   * @throws {Error} 403 Forbidden if called with an access token
+   * @throws {Error} 403 Forbidden if called with a session token
    */
-  async createAccessToken(options?: {
+  async createSessionToken(options?: {
     description?: string;
     expiresIn?: number; // seconds, default 7 days (604800)
-  }): Promise<AccessTokenResponse> {
-    return this.request<AccessTokenResponse>('/auth/tokens', {
+  }): Promise<SessionTokenResponse> {
+    return this.request<SessionTokenResponse>('/auth/session_tokens', {
       method: 'POST',
       body: JSON.stringify(options || {}),
     });
   }
 
   /**
-   * List all access tokens (requires license JWT)
+   * List all session tokens (requires access token)
    *
-   * @throws {Error} 403 Forbidden if called with an access token
+   * @throws {Error} 403 Forbidden if called with a session token
    */
-  async listAccessTokens(): Promise<AccessTokenListResponse> {
-    return this.request<AccessTokenListResponse>('/auth/tokens');
+  async listSessionTokens(): Promise<SessionTokenListResponse> {
+    return this.request<SessionTokenListResponse>('/auth/session_tokens');
   }
 
   /**
-   * Get details of a specific access token (requires license JWT)
+   * Get details of a specific session token (requires access token)
    *
    * @param tokenId - The token ID
-   * @throws {Error} 403 Forbidden if called with an access token
+   * @throws {Error} 403 Forbidden if called with a session token
    */
-  async getAccessToken(tokenId: string): Promise<AccessTokenResponse> {
-    return this.request<AccessTokenResponse>(`/auth/tokens/${tokenId}`);
+  async getSessionToken(tokenId: string): Promise<SessionTokenResponse> {
+    return this.request<SessionTokenResponse>(`/auth/session_tokens/${tokenId}`);
   }
 
   /**
-   * Revoke an access token (requires license JWT)
+   * Revoke a session token (requires access token)
    *
    * @param tokenId - The token ID to revoke
-   * @throws {Error} 403 Forbidden if called with an access token
+   * @throws {Error} 403 Forbidden if called with a session token
    */
-  async revokeAccessToken(tokenId: string): Promise<void> {
-    return this.request<void>(`/auth/tokens/${tokenId}`, {
+  async revokeSessionToken(tokenId: string): Promise<void> {
+    return this.request<void>(`/auth/session_tokens/${tokenId}`, {
       method: 'DELETE',
     });
   }
 
   /**
-   * Generate a magic link for browser authentication (requires license JWT)
+   * Generate a magic link for browser authentication (requires access token)
    *
-   * Magic links are one-time URLs that automatically create an access token
+   * Magic links are one-time URLs that automatically create a session token
    * and set it as a cookie in the user's browser. This provides an easy way
    * to authenticate users in browser-based applications.
    *
    * The generated link:
    * - Expires after 5 minutes or first use (whichever comes first)
-   * - Automatically creates a new access token (7 day expiry)
-   * - Sets the access token as an HttpOnly cookie
+   * - Automatically creates a new session token (7 day expiry)
+   * - Sets the session token as an HttpOnly cookie
    * - Redirects to the specified URL
    *
    * @param options - Magic link configuration
-   * @throws {Error} 403 Forbidden if called with an access token
+   * @throws {Error} 403 Forbidden if called with a session token
    */
   async createMagicLink(options?: {
     redirectUrl?: string; // default: /play/
   }): Promise<MagicLinkResponse> {
-    return this.request<MagicLinkResponse>('/auth/magic-link', {
+    return this.request<MagicLinkResponse>('/auth/magic-links', {
       method: 'POST',
       body: JSON.stringify(options || {}),
     });
@@ -616,7 +693,7 @@ export class ComputeClient {
 
   /**
    * Set authentication token manually
-   * @param token - License JWT or access token
+   * @param token - Access token or session token
    */
   setToken(token: string): void {
     this._token = token;
@@ -627,6 +704,13 @@ export class ComputeClient {
    */
   getToken(): string | null {
     return this._token;
+  }
+
+  /**
+   * Get current sandbox URL
+   */
+  getSandboxUrl(): string {
+    return this.config.sandboxUrl;
   }
 
   // ============================================================================
@@ -761,10 +845,10 @@ export class ComputeClient {
     );
 
     // Set up terminal handlers
-    terminal.setExecuteHandler(async (command: string) => {
+    terminal.setExecuteHandler(async (command: string, async?: boolean) => {
       return this.request<CommandExecutionResponse>(`/terminals/${response.data.id}/execute`, {
         method: 'POST',
-        body: JSON.stringify({ command }),
+        body: JSON.stringify({ command, async }),
       });
     });
 
@@ -1000,8 +1084,17 @@ export class ComputeClient {
   private getWebSocketUrl(): string {
     const wsProtocol = this.config.sandboxUrl.startsWith('https') ? 'wss' : 'ws';
     const url = this.config.sandboxUrl.replace(/^https?:/, `${wsProtocol}:`);
-    const token = this._token ? `?token=${this._token}` : '';
-    return `${url}/ws${token}`;
+
+    // Build query parameters
+    const params = new URLSearchParams();
+    if (this._token) {
+      params.set('token', this._token);
+    }
+    // Always send protocol parameter
+    params.set('protocol', this.config.protocol || 'binary');
+
+    const queryString = params.toString();
+    return `${url}/ws${queryString ? `?${queryString}` : ''}`;
   }
 
   // ============================================================================
@@ -1062,6 +1155,14 @@ export class ComputeClient {
   }
 
   /**
+   * Get server information
+   * Returns details about the server including auth status, main subdomain, sandbox count, and version
+   */
+  async getServerInfo(): Promise<InfoResponse> {
+    return this.request<InfoResponse>('/info');
+  }
+
+  /**
    * Get sandbox information (Sandbox interface method)
    */
   async getInfo(): Promise<{
@@ -1089,9 +1190,23 @@ export class ComputeClient {
    */
   async getUrl(options: { port: number; protocol?: string }): Promise<string> {
     const protocol = options.protocol || 'https';
-    // Extract subdomain from sandboxUrl
+    // Extract components from sandboxUrl
     const url = new URL(this.config.sandboxUrl);
-    return `${protocol}://${url.host}:${options.port}`;
+    const parts = url.hostname.split('.');
+    const subdomain = parts[0]; // Extract "sandbox-123" or "abc"
+    const baseDomain = parts.slice(1).join('.'); // Extract "sandbox.computesdk.com" or "preview.computesdk.com"
+
+    // ComputeSDK has two domains:
+    // - sandbox.computesdk.com: Management/control plane
+    // - preview.computesdk.com: Preview URLs for services
+    // When getting a URL for a port, we need the preview domain
+    const previewDomain = baseDomain.replace('sandbox.computesdk.com', 'preview.computesdk.com');
+
+    // ComputeSDK URL pattern: ${subdomain}-${port}.${previewDomain}
+    // Examples:
+    //   - https://abc.sandbox.computesdk.com → https://abc-3000.preview.computesdk.com
+    //   - https://sandbox-123.preview.computesdk.com → https://sandbox-123-3000.preview.computesdk.com
+    return `${protocol}://${subdomain}-${options.port}.${previewDomain}`;
   }
 
   /**
@@ -1153,10 +1268,10 @@ export class ComputeClient {
  * ```typescript
  * import { createClient } from '@computesdk/client'
  *
- * // Create client with access token
+ * // Create client with access token or session token
  * const client = createClient({
  *   sandboxUrl: 'https://sandbox-123.preview.computesdk.com',
- *   token: accessToken, // Access token from createAccessToken()
+ *   token: accessToken, // Access token from edge service or session token from createSessionToken()
  * });
  *
  * // Execute commands

@@ -1,31 +1,39 @@
 # @computesdk/client
 
-## 0.2.3
+## 0.3.4
 
 ### Patch Changes
 
-- 7d21636: Fixing auth
+- f0eef79: moving to access token
+- f0eef79: Adding enhanced sandbox
 
-## 0.2.2
-
-### Patch Changes
-
-- 9e239be: quieting logs
-
-## 0.2.1
+## 0.3.3
 
 ### Patch Changes
 
-- 567f763: Updates to client
+- 11a3b8c: moving to access token
+- 11a3b8c: Adding enhanced sandbox
 
-## 0.2.0
+## 0.3.2
+
+### Patch Changes
+
+- 483c700: Adding enhanced sandbox
+
+## 0.3.1
+
+### Patch Changes
+
+- 3ebbbc2: adding signals to the sdk
+
+## 0.3.0
 
 ### Minor Changes
 
-- 17f1d0b: Adding in WC
+- 99b807c: Integrating packages w/ @computesdk/client
 
-## 0.1.0
+## 0.2.6
 
-### Minor Changes
+### Patch Changes
 
-- 507462b: Initial release
+- 6296b62: Updating access tokens
